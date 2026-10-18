@@ -1,0 +1,109 @@
+# 放到仓库的 .github/workflows/ios-unsigned-ipa.yml
+# 作用：在 GitHub 的 macOS runner 上编译 HAPI 的 iOS App，产出「未签名 .ipa」
+#       之后用 Sideloadly / AltStore / SideStore / ESign 等工具在 Windows 上自签安装。
+# 不需要 Apple 开发者账号，公开仓库的 macOS runner 不消耗额度。
+name: iOS IPA (unsigned)
+on:
+  # 手动点击运行（workflow 文件必须在默认分支 main 上才会出现在 Actions 里）
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: '构建配置'
+        type: choice
+        options: [Release, Debug]
+        default: Release
+  # 打 tag 时也自动跑一次
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15          # Xcode 16.x；项目要求 Xcode 16+ / iOS 17+ 的 SDK
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: 打印工具链版本
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+      - name: 打印工程里的 target / bundle id（排错用）
+        working-directory: ios
+        run: |
+          xcodebuild -project Hapi.xcodeproj -list
+          for t in Hapi HapiNotificationService; do
+            echo "== $t =="
+            xcodebuild -project Hapi.xcodeproj -target "$t" -showBuildSettings -sdk iphoneos 2>/dev/null \
+              | grep -E 'PRODUCT_BUNDLE_IDENTIFIER|PRODUCT_NAME|IPHONEOS_DEPLOYMENT_TARGET' || true
+          done
+      - name: 解析 Swift Package 依赖
+        working-directory: ios
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project Hapi.xcodeproj \
+            -scheme Hapi
+      - name: 编译（关闭签名）
+        working-directory: ios
+        env:
+          CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project Hapi.xcodeproj \
+            -scheme Hapi \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            SWIFT_EMIT_LOC_STRINGS=NO \
+            | tee build.log
+      - name: 打包成 Payload/Hapi.app -> .ipa
+        working-directory: ios
+        env:
+          CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+        run: |
+          set -euo pipefail
+          PRODUCTS="build/Build/Products/${CONFIGURATION}-iphoneos"
+          APP_PATH="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "${APP_PATH}" ]; then
+            echo "::error::在 $PRODUCTS 下没找到 .app，下面是实际产物："
+            ls -laR "$PRODUCTS" | head -n 200
+            exit 1
+          fi
+          echo "App bundle: $APP_PATH"
+          echo "Bundle ID : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")"
+          echo "Version   : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Info.plist")"
+          echo "Build     : $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Info.plist")"
+          rm -rf Payload Hapi-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          # -y 保留符号链接，避免 Framework 结构损坏
+          zip -qry Hapi-unsigned.ipa Payload
+          echo "---- IPA 内容（前 20 项）----"
+          unzip -l Hapi-unsigned.ipa | head -n 20
+          ls -lh Hapi-unsigned.ipa
+      - name: 上传 IPA 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: hapi-ios-unsigned-${{ github.sha }}
+          path: ios/Hapi-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+      - name: 失败时也上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.sha }}
+          path: ios/build.log
+          if-no-files-found: ignore
+          retention-days: 7
